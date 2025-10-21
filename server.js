@@ -4,7 +4,6 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const { v4: uuid } = require('uuid');
 
 // ---- ENV (set these in Vercel Project → Settings → Environment Variables)
 const {
@@ -67,7 +66,8 @@ function toSlug(str) {
     .replace(/(^-|-$)/g, '');
 }
 
-function s3KeyFor(kind='news', filename='cover.webp') {
+async function s3KeyFor(kind='news', filename='cover.webp') {
+  const { v4: uuid } = await import('uuid');
   const d = new Date();
   const year = d.getUTCFullYear();
   const month = String(d.getUTCMonth()+1).padStart(2,'0');
@@ -98,7 +98,7 @@ app.post('/api/upload', adminOnly, async (req, res) => {
     const buffer = Buffer.from(base64, 'base64');
 
     const safeName = (String(filename || 'cover.webp').toLowerCase().replace(/[^a-z0-9.\-_]+/g, '-') || 'cover.webp');
-    const key = s3KeyFor('news', safeName.endsWith('.webp') ? safeName : (safeName.replace(/\.[^.]+$/, '') + '.webp'));
+    const key = await s3KeyFor('news', safeName.endsWith('.webp') ? safeName : (safeName.replace(/\.[^.]+$/, '') + '.webp'));
 
     await s3.send(new PutObjectCommand({
       Bucket: R2_BUCKET,
@@ -204,7 +204,7 @@ app.get('/api/tags', async (_req,res) => {
 app.post('/api/news', adminOnly, async (req,res) => {
   try {
     const body = req.body || {};
-    const slug = toSlug(body.slug || body.title || uuid());
+    const slug = toSlug(body.slug || body.title || (await import('uuid')).v4());
     const item = await News.create({
       slug,
       title: body.title || '',
