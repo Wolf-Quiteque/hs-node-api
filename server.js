@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { randomUUID } = require('crypto');
 
 // ---- ENV (set these in Vercel Project → Settings → Environment Variables)
 const {
@@ -66,12 +67,11 @@ function toSlug(str) {
     .replace(/(^-|-$)/g, '');
 }
 
-async function s3KeyFor(kind='news', filename='cover.webp') {
-  const { v4: uuid } = await import('uuid');
+function s3KeyFor(kind='news', filename='cover.webp') {
   const d = new Date();
   const year = d.getUTCFullYear();
   const month = String(d.getUTCMonth()+1).padStart(2,'0');
-  return `${kind}/${year}/${month}/${uuid()}-${filename}`;
+  return `${kind}/${year}/${month}/${randomUUID()}-${filename}`;
 }
 
 // Build public URL (your env should already include '/<bucket>' for r2.dev)
@@ -98,7 +98,7 @@ app.post('/api/upload', adminOnly, async (req, res) => {
     const buffer = Buffer.from(base64, 'base64');
 
     const safeName = (String(filename || 'cover.webp').toLowerCase().replace(/[^a-z0-9.\-_]+/g, '-') || 'cover.webp');
-    const key = await s3KeyFor('news', safeName.endsWith('.webp') ? safeName : (safeName.replace(/\.[^.]+$/, '') + '.webp'));
+    const key = s3KeyFor('news', safeName.endsWith('.webp') ? safeName : (safeName.replace(/\.[^.]+$/, '') + '.webp'));
 
     await s3.send(new PutObjectCommand({
       Bucket: R2_BUCKET,
@@ -204,7 +204,7 @@ app.get('/api/tags', async (_req,res) => {
 app.post('/api/news', adminOnly, async (req,res) => {
   try {
     const body = req.body || {};
-    const slug = toSlug(body.slug || body.title || (await import('uuid')).v4());
+    const slug = toSlug(body.slug || body.title || randomUUID());
     const item = await News.create({
       slug,
       title: body.title || '',
