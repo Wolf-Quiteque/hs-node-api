@@ -1,12 +1,16 @@
-// /api/index.js
-const serverless = require('serverless-http');
+require('dotenv').config(); // fine for local; on Vercel env comes from dashboard
+
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
-const { randomUUID } = require('crypto');
+const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
+const { randomUUID } = require('crypto');   // ✅ use built-in UUID
 
-// ---- ENV (set these in Vercel Project → Settings → Environment Variables)
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
 const {
   ADMIN_KEY = 'changeme',
   MONGODB_URI = '',
@@ -17,22 +21,22 @@ const {
   R2_PUBLIC_BASE_URL = ''
 } = process.env;
 
-// ---- Express
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-// ---- MongoDB (cache connection across invocations)
-let mongoConn;
-async function connectMongo() {
-  if (mongoConn) return mongoConn;
+// ---- Mongo: lazy connect + timeouts (prevents 300s timeouts)
+let mongoReady = null;
+async function ensureMongo() {
+  if (mongoReady) return mongoReady;
+  if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
   mongoose.set('strictQuery', true);
-  mongoConn = await mongoose.connect(MONGODB_URI, { dbName: 'news' });
-  return mongoConn;
+  mongoReady = mongoose.connect(MONGODB_URI, {
+    dbName: 'news',
+    serverSelectionTimeoutMS: 8000, // 8s to connect or fail
+    socketTimeoutMS: 20000,
+    maxPoolSize: 5
+  });
+  return mongoReady;
 }
-app.use(async (_req, _res, next) => { await connectMongo(); next(); });
 
-// ---- Mongoose model (avoid recompilation on hot starts)
+// ---- Model (guard against recompile on hot start)
 const NewsSchema = new mongoose.Schema({
   slug: { type: String, required: true, unique: true, index: true },
   title: { type: String, required: true },
@@ -46,11 +50,15 @@ const NewsSchema = new mongoose.Schema({
 }, { timestamps: true });
 const News = mongoose.models.News || mongoose.model('News', NewsSchema);
 
-// ---- R2 (S3-compatible)
+// ---- R2 client with timeouts (prevents hangs)
 const s3 = new S3Client({
   region: 'auto',
   endpoint: R2_ENDPOINT,
-  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY }
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+  requestHandler: new NodeHttpHandler({
+    connectionTimeout: 3000, // 3s
+    requestTimeout: 10000    // 10s
+  })
 });
 
 function adminOnly(req, res, next) {
@@ -58,7 +66,6 @@ function adminOnly(req, res, next) {
   if (key !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
-
 function toSlug(str) {
   return String(str || 'noticia')
     .toLowerCase()
@@ -66,28 +73,33 @@ function toSlug(str) {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/(^-|-$)/g, '');
 }
-
 function s3KeyFor(kind='news', filename='cover.webp') {
   const d = new Date();
   const year = d.getUTCFullYear();
   const month = String(d.getUTCMonth()+1).padStart(2,'0');
-  return `${kind}/${year}/${month}/${randomUUID()}-${filename}`;
+  return `${kind}/${year}/${month}/${randomUUID()}-${filename}`;   // ✅
 }
-
-// Build public URL (your env should already include '/<bucket>' for r2.dev)
 function buildPublicUrl(key) {
+  // You’re using Option A: R2_PUBLIC_BASE_URL already includes /<bucket>
   return `${R2_PUBLIC_BASE_URL.replace(/\/+$/,'')}/${key}`;
 }
 function extractKeyFromPublicUrl(publicUrl) {
   const base = R2_PUBLIC_BASE_URL.replace(/\/+$/,'');
   let rest = String(publicUrl).replace(base, '').replace(/^\/+/, '');
-  // If R2_PUBLIC_BASE_URL includes '/<bucket>', strip it from key:
   const bucketPath = `/${R2_BUCKET}/`;
   if (rest.startsWith(bucketPath)) rest = rest.slice(bucketPath.length);
   return rest;
 }
 
-// ---- Upload (expects data:image/webp;base64,...)
+// ---- Health endpoints (help debug quickly)
+app.get('/api/health', (_req,res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/api/db-health', async (_req,res) => {
+  const t0 = Date.now();
+  try { await ensureMongo(); return res.json({ ok: true, ms: Date.now()-t0 }); }
+  catch (e) { return res.status(500).json({ ok: false, error: String(e) }); }
+});
+
+// ---- Upload (no DB needed)
 app.post('/api/upload', adminOnly, async (req, res) => {
   try {
     const { dataUrl, filename } = req.body || {};
@@ -96,7 +108,6 @@ app.post('/api/upload', adminOnly, async (req, res) => {
     }
     const base64 = dataUrl.split(',')[1];
     const buffer = Buffer.from(base64, 'base64');
-
     const safeName = (String(filename || 'cover.webp').toLowerCase().replace(/[^a-z0-9.\-_]+/g, '-') || 'cover.webp');
     const key = s3KeyFor('news', safeName.endsWith('.webp') ? safeName : (safeName.replace(/\.[^.]+$/, '') + '.webp'));
 
@@ -115,13 +126,13 @@ app.post('/api/upload', adminOnly, async (req, res) => {
   }
 });
 
-// ---- CRUD
+// ---- CRUD routes (ensure Mongo inside each)
 app.get('/api/news', async (req,res) => {
   try {
+    await ensureMongo();
     const { page=1, limit=6, category, tag, q } = req.query;
     const p = Math.max(1, parseInt(page, 10) || 1);
     const lim = Math.min(50, Math.max(1, parseInt(limit, 10) || 6));
-
     const where = {};
     if (category) where.categories = { $in: [ new RegExp(`^${String(category)}$`, 'i') ] };
     if (tag) where.tags = { $in: [ new RegExp(`^${String(tag)}$`, 'i') ] };
@@ -133,14 +144,8 @@ app.get('/api/news', async (req,res) => {
         { author:  { $regex: s, $options: 'i' } },
       ];
     }
-
     const total = await News.countDocuments(where);
-    const data = await News.find(where)
-      .sort({ date: -1, createdAt: -1 })
-      .skip((p-1)*lim)
-      .limit(lim)
-      .lean();
-
+    const data = await News.find(where).sort({ date: -1, createdAt: -1 }).skip((p-1)*lim).limit(lim).lean();
     res.json({ data, pagination: { page: p, limit: lim, total, totalPages: Math.max(1, Math.ceil(total/lim)) } });
   } catch (e) {
     console.error('[GET /api/news] error', e);
@@ -150,6 +155,7 @@ app.get('/api/news', async (req,res) => {
 
 app.get('/api/news/:slug', async (req,res) => {
   try {
+    await ensureMongo();
     const idOrSlug = req.params.slug;
     const item = await News.findOne({ $or: [{ slug: idOrSlug }, { _id: idOrSlug }] }).lean();
     if (!item) return res.status(404).json({ error: 'Not found' });
@@ -162,6 +168,7 @@ app.get('/api/news/:slug', async (req,res) => {
 
 app.get('/api/recent', async (req,res) => {
   try {
+    await ensureMongo();
     const limit = Math.min(10, Math.max(1, parseInt(req.query.limit || '3', 10)));
     const data = await News.find({}).sort({ date: -1, createdAt: -1 }).limit(limit).lean();
     res.json({ data });
@@ -173,6 +180,7 @@ app.get('/api/recent', async (req,res) => {
 
 app.get('/api/categories', async (_req,res) => {
   try {
+    await ensureMongo();
     const agg = await News.aggregate([
       { $unwind: { path: "$categories", preserveNullAndEmptyArrays: false } },
       { $group: { _id: { $toLower: "$categories" }, count: { $sum: 1 } } },
@@ -188,6 +196,7 @@ app.get('/api/categories', async (_req,res) => {
 
 app.get('/api/tags', async (_req,res) => {
   try {
+    await ensureMongo();
     const agg = await News.aggregate([
       { $unwind: { path: "$tags", preserveNullAndEmptyArrays: false } },
       { $group: { _id: { $toLower: "$tags" }, count: { $sum: 1 } } },
@@ -203,8 +212,9 @@ app.get('/api/tags', async (_req,res) => {
 
 app.post('/api/news', adminOnly, async (req,res) => {
   try {
+    await ensureMongo();
     const body = req.body || {};
-    const slug = toSlug(body.slug || body.title || randomUUID());
+    const slug = toSlug(body.slug || body.title || randomUUID());   // ✅
     const item = await News.create({
       slug,
       title: body.title || '',
@@ -226,18 +236,17 @@ app.post('/api/news', adminOnly, async (req,res) => {
 
 app.put('/api/news/:id', adminOnly, async (req,res) => {
   try {
+    await ensureMongo();
     const idOrSlug = req.params.id;
     const body = req.body || {};
     const found = await News.findOne({ $or: [{ _id: idOrSlug }, { slug: idOrSlug }] });
     if (!found) return res.status(404).json({ error: 'Not found' });
-
     if (body.slug && body.slug !== found.slug) {
       const newSlug = toSlug(body.slug);
       const exists = await News.exists({ slug: newSlug });
       if (exists) return res.status(409).json({ error: 'Slug already exists' });
       body.slug = newSlug;
     }
-
     Object.assign(found, body);
     await found.save();
     res.json(found);
@@ -249,6 +258,7 @@ app.put('/api/news/:id', adminOnly, async (req,res) => {
 
 app.delete('/api/news/:id', adminOnly, async (req,res) => {
   try {
+    await ensureMongo();
     const idOrSlug = req.params.id;
     const found = await News.findOneAndDelete({ $or: [{ _id: idOrSlug }, { slug: idOrSlug }] });
     if (!found) return res.status(404).json({ error: 'Not found' });
@@ -269,5 +279,6 @@ app.delete('/api/news/:id', adminOnly, async (req,res) => {
   }
 });
 
-// ---- Export as serverless handler (NO app.listen)
-module.exports = serverless(app);
+// 👉 IMPORTANT: no app.listen() on Vercel
+// Export a handler so @vercel/node can invoke it:
+module.exports = app;          // Express is a handler function (req, res)

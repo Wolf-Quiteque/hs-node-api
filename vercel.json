@@ -1,16 +1,9 @@
 {
-    "version": 2,
-    "builds": [
-      {
-        "src": "./server.js",
-        "use": "@vercel/node"
-      }
-    ],
-    "routes": [
-      {
-        "src": "/(.*)",
-        "dest": "/server.js"
-      }
-    ]
-  }
-  
+  "version": 2,
+  "functions": {
+    "server.js": { "runtime": "nodejs20.x", "maxDuration": 30 }
+  },
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/server.js" }
+  ]
+}
