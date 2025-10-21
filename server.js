@@ -1,64 +1,38 @@
-
-/**
- * News REST API with MongoDB + Cloudflare R2 (S3-compatible)
- *
- * Install:
- *   npm init -y
- *   npm i express cors mongoose @aws-sdk/client-s3 uuid
- *
- * Env:
- *   PORT=4000
- *   ADMIN_KEY=changeme
- *   MONGODB_URI=mongodb+srv://<user>:<pass>@<cluster>/news?retryWrites=true&w=majority
- *
- *   # Cloudflare R2 (S3-compatible)
- *   R2_ACCOUNT_ID=<account-id>
- *   R2_ACCESS_KEY_ID=<access-key-id>
- *   R2_SECRET_ACCESS_KEY=<secret>
- *   R2_BUCKET=<bucket-name>
- *   # The S3 endpoint for R2:
- *   R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
- *   # Public base URL for your bucket (r2.dev custom domain or your own CDN):
- *   R2_PUBLIC_BASE_URL=https://<your-public-domain-or-r2.dev-bucket>
- */
-
-require('dotenv').config();
-
+// /api/index.js
+const serverless = require('serverless-http');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { v4: uuid } = require('uuid');
 
-// --- Setup
+// ---- ENV (set these in Vercel Project → Settings → Environment Variables)
+const {
+  ADMIN_KEY = 'changeme',
+  MONGODB_URI = '',
+  R2_BUCKET = '',
+  R2_ENDPOINT = '',
+  R2_ACCESS_KEY_ID = '',
+  R2_SECRET_ACCESS_KEY = '',
+  R2_PUBLIC_BASE_URL = ''
+} = process.env;
+
+// ---- Express
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-const PORT = process.env.PORT || 4000;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'changeme';
+// ---- MongoDB (cache connection across invocations)
+let mongoConn;
+async function connectMongo() {
+  if (mongoConn) return mongoConn;
+  mongoose.set('strictQuery', true);
+  mongoConn = await mongoose.connect(MONGODB_URI, { dbName: 'news' });
+  return mongoConn;
+}
+app.use(async (_req, _res, next) => { await connectMongo(); next(); });
 
-const {
-  MONGODB_URI,
-  R2_ACCOUNT_ID,
-  R2_ACCESS_KEY_ID,
-  R2_SECRET_ACCESS_KEY,
-  R2_BUCKET,
-  R2_ENDPOINT,
-  R2_PUBLIC_BASE_URL
-} = process.env;
-
-if (!MONGODB_URI) console.warn('[WARN] Missing MONGODB_URI');
-if (!R2_BUCKET) console.warn('[WARN] Missing R2_BUCKET');
-if (!R2_ENDPOINT) console.warn('[WARN] Missing R2_ENDPOINT');
-if (!R2_PUBLIC_BASE_URL) console.warn('[WARN] Missing R2_PUBLIC_BASE_URL');
-
-// --- MongoDB
-mongoose.set('strictQuery', true);
-mongoose.connect(MONGODB_URI, { dbName: 'news' })
-  .then(() => console.log('[MongoDB] connected'))
-  .catch(err => console.error('[MongoDB] connection error', err));
-
+// ---- Mongoose model (avoid recompilation on hot starts)
 const NewsSchema = new mongoose.Schema({
   slug: { type: String, required: true, unique: true, index: true },
   title: { type: String, required: true },
@@ -70,17 +44,13 @@ const NewsSchema = new mongoose.Schema({
   tags: { type: [String], default: [] },
   content: { type: String, default: '' },
 }, { timestamps: true });
+const News = mongoose.models.News || mongoose.model('News', NewsSchema);
 
-const News = mongoose.model('News', NewsSchema);
-
-// --- Cloudflare R2 via AWS SDK v3
+// ---- R2 (S3-compatible)
 const s3 = new S3Client({
   region: 'auto',
   endpoint: R2_ENDPOINT,
-  credentials: {
-    accessKeyId: R2_ACCESS_KEY_ID || '',
-    secretAccessKey: R2_SECRET_ACCESS_KEY || ''
-  }
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY }
 });
 
 function adminOnly(req, res, next) {
@@ -104,17 +74,30 @@ function s3KeyFor(kind='news', filename='cover.webp') {
   return `${kind}/${year}/${month}/${uuid()}-${filename}`;
 }
 
-// --- Upload endpoint (expects WEBP dataURL to enforce client-side conversion)
+// Build public URL (your env should already include '/<bucket>' for r2.dev)
+function buildPublicUrl(key) {
+  return `${R2_PUBLIC_BASE_URL.replace(/\/+$/,'')}/${key}`;
+}
+function extractKeyFromPublicUrl(publicUrl) {
+  const base = R2_PUBLIC_BASE_URL.replace(/\/+$/,'');
+  let rest = String(publicUrl).replace(base, '').replace(/^\/+/, '');
+  // If R2_PUBLIC_BASE_URL includes '/<bucket>', strip it from key:
+  const bucketPath = `/${R2_BUCKET}/`;
+  if (rest.startsWith(bucketPath)) rest = rest.slice(bucketPath.length);
+  return rest;
+}
+
+// ---- Upload (expects data:image/webp;base64,...)
 app.post('/api/upload', adminOnly, async (req, res) => {
   try {
     const { dataUrl, filename } = req.body || {};
-    if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/webp;base64,')) {
+    if (!dataUrl || !String(dataUrl).startsWith('data:image/webp;base64,')) {
       return res.status(400).json({ error: 'Provide a WEBP dataUrl' });
     }
     const base64 = dataUrl.split(',')[1];
     const buffer = Buffer.from(base64, 'base64');
 
-    const safeName = (String(filename || 'cover.webp').toLowerCase().replace(/[^a-z0-9\.\-_]+/g, '-') || 'cover.webp');
+    const safeName = (String(filename || 'cover.webp').toLowerCase().replace(/[^a-z0-9.\-_]+/g, '-') || 'cover.webp');
     const key = s3KeyFor('news', safeName.endsWith('.webp') ? safeName : (safeName.replace(/\.[^.]+$/, '') + '.webp'));
 
     await s3.send(new PutObjectCommand({
@@ -125,16 +108,14 @@ app.post('/api/upload', adminOnly, async (req, res) => {
       CacheControl: 'public, max-age=31536000, immutable'
     }));
 
-    const publicUrl = `${R2_PUBLIC_BASE_URL.replace(/\/+$/,'')}/${key}`;
-    return res.json({ url: publicUrl, key });
+    return res.json({ url: buildPublicUrl(key), key });
   } catch (e) {
     console.error('[upload] error', e);
     return res.status(500).json({ error: 'Upload failed' });
   }
 });
 
-// --- CRUD
-// List with filters + pagination
+// ---- CRUD
 app.get('/api/news', async (req,res) => {
   try {
     const { page=1, limit=6, category, tag, q } = req.query;
@@ -160,10 +141,7 @@ app.get('/api/news', async (req,res) => {
       .limit(lim)
       .lean();
 
-    return res.json({
-      data,
-      pagination: { page: p, limit: lim, total, totalPages: Math.max(1, Math.ceil(total/lim)) }
-    });
+    res.json({ data, pagination: { page: p, limit: lim, total, totalPages: Math.max(1, Math.ceil(total/lim)) } });
   } catch (e) {
     console.error('[GET /api/news] error', e);
     res.status(500).json({ error: 'Failed' });
@@ -193,7 +171,7 @@ app.get('/api/recent', async (req,res) => {
   }
 });
 
-app.get('/api/categories', async (req,res) => {
+app.get('/api/categories', async (_req,res) => {
   try {
     const agg = await News.aggregate([
       { $unwind: { path: "$categories", preserveNullAndEmptyArrays: false } },
@@ -208,7 +186,7 @@ app.get('/api/categories', async (req,res) => {
   }
 });
 
-app.get('/api/tags', async (req,res) => {
+app.get('/api/tags', async (_req,res) => {
   try {
     const agg = await News.aggregate([
       { $unwind: { path: "$tags", preserveNullAndEmptyArrays: false } },
@@ -223,7 +201,6 @@ app.get('/api/tags', async (req,res) => {
   }
 });
 
-// Create
 app.post('/api/news', adminOnly, async (req,res) => {
   try {
     const body = req.body || {};
@@ -241,15 +218,12 @@ app.post('/api/news', adminOnly, async (req,res) => {
     });
     res.status(201).json(item);
   } catch (e) {
-    if (e.code === 11000) {
-      return res.status(409).json({ error: 'Slug already exists' });
-    }
+    if (e.code === 11000) return res.status(409).json({ error: 'Slug already exists' });
     console.error('[POST /api/news] error', e);
     res.status(500).json({ error: 'Failed' });
   }
 });
 
-// Update
 app.put('/api/news/:id', adminOnly, async (req,res) => {
   try {
     const idOrSlug = req.params.id;
@@ -257,7 +231,6 @@ app.put('/api/news/:id', adminOnly, async (req,res) => {
     const found = await News.findOne({ $or: [{ _id: idOrSlug }, { slug: idOrSlug }] });
     if (!found) return res.status(404).json({ error: 'Not found' });
 
-    // Prevent duplicate slug on update
     if (body.slug && body.slug !== found.slug) {
       const newSlug = toSlug(body.slug);
       const exists = await News.exists({ slug: newSlug });
@@ -274,17 +247,15 @@ app.put('/api/news/:id', adminOnly, async (req,res) => {
   }
 });
 
-// Delete
 app.delete('/api/news/:id', adminOnly, async (req,res) => {
   try {
     const idOrSlug = req.params.id;
     const found = await News.findOneAndDelete({ $or: [{ _id: idOrSlug }, { slug: idOrSlug }] });
     if (!found) return res.status(404).json({ error: 'Not found' });
 
-    // Optional: if cover is on this bucket, attempt to delete best-effort
     try {
       if (found.cover && R2_PUBLIC_BASE_URL && found.cover.startsWith(R2_PUBLIC_BASE_URL)) {
-        const key = found.cover.replace(R2_PUBLIC_BASE_URL, '').replace(/^\/+/, '');
+        const key = extractKeyFromPublicUrl(found.cover);
         await s3.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key }));
       }
     } catch (e) {
@@ -298,6 +269,5 @@ app.delete('/api/news/:id', adminOnly, async (req,res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`News API (Mongo + R2) listening on http://localhost:${PORT}`);
-});
+// ---- Export as serverless handler (NO app.listen)
+module.exports = serverless(app);
