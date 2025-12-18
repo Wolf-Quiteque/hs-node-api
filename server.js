@@ -279,6 +279,113 @@ app.delete('/api/news/:id', adminOnly, async (req,res) => {
   }
 });
 
+
+
+// ---- Attendance Route for Aprenda & Empreenda Event
+const AttendanceSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  phone: { type: String, required: true },
+  event: { type: String, default: 'Aprenda & Empreenda' },
+  date: { type: Date, default: Date.now },
+  confirmed: { type: Boolean, default: false }
+}, { timestamps: true });
+
+const Attendance = mongoose.models.Attendance || mongoose.model('Attendance', AttendanceSchema);
+
+// POST route to save attendance
+app.post('/api/attendance', async (req, res) => {
+  try {
+    await ensureMongo();
+    
+    const { name, phone } = req.body;
+    
+    // Basic validation
+    if (!name || !phone) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Nome e telefone são obrigatórios' 
+      });
+    }
+    
+    if (name.length < 3) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Nome deve ter pelo menos 3 caracteres' 
+      });
+    }
+    
+    if (phone.length < 9) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Telefone deve ter pelo menos 9 dígitos' 
+      });
+    }
+    
+    // Check if this phone already registered
+    const existing = await Attendance.findOne({ 
+      phone: phone,
+      event: 'Aprenda & Empreenda'
+    });
+    
+    if (existing) {
+      return res.status(409).json({ 
+        success: false, 
+        message: 'Este número já foi registado para o evento' 
+      });
+    }
+    
+    // Create attendance record
+    const attendance = await Attendance.create({
+      name: name.trim(),
+      phone: phone.trim(),
+      event: 'Aprenda & Empreenda',
+      date: new Date(),
+      confirmed: true
+    });
+    
+    res.status(201).json({ 
+      success: true, 
+      message: 'Presença confirmada com sucesso!',
+      data: {
+        id: attendance._id,
+        name: attendance.name,
+        phone: attendance.phone,
+        date: attendance.date
+      }
+    });
+    
+  } catch (e) {
+    console.error('[POST /api/attendance] error', e);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Erro ao processar a inscrição. Tente novamente.' 
+    });
+  }
+});
+
+// Optional: GET route to see all attendees (admin only)
+app.get('/api/attendance', adminOnly, async (req, res) => {
+  try {
+    await ensureMongo();
+    const { event = 'Aprenda & Empreenda' } = req.query;
+    const attendees = await Attendance.find({ event })
+      .sort({ date: -1 })
+      .lean();
+    
+    res.json({ 
+      success: true, 
+      count: attendees.length,
+      data: attendees 
+    });
+  } catch (e) {
+    console.error('[GET /api/attendance] error', e);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Erro ao obter lista de participantes' 
+    });
+  }
+});
+
 // 👉 IMPORTANT: no app.listen() on Vercel
 // Export a handler so @vercel/node can invoke it:
 module.exports = app;          // Express is a handler function (req, res)
