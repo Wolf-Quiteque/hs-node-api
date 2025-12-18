@@ -417,7 +417,7 @@ async function sendOmbalaSMS(phoneNumber, message) {
     const payload = {
       message: message,
       from: OMBALA_SENDER_NAME,
-      to: formattedPhone
+      to: cleanPhone
     };
     
     const response = await axios.post(OMBALA_API_URL, payload, {
