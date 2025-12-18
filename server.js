@@ -287,9 +287,12 @@ const AttendanceSchema = new mongoose.Schema({
   phone: { type: String, required: true },
   event: { type: String, default: 'Aprenda & Empreenda' },
   date: { type: Date, default: Date.now },
-  confirmed: { type: Boolean, default: false }
+  confirmed: { type: Boolean, default: false },
+  smsSent: { type: Boolean, default: false },
+  smsSentAt: { type: Date },
+  smsMessageId: { type: String },
+  smsError: { type: String }
 }, { timestamps: true });
-
 const Attendance = mongoose.models.Attendance || mongoose.model('Attendance', AttendanceSchema);
 
 // POST route to save attendance
@@ -382,6 +385,239 @@ app.get('/api/attendance', adminOnly, async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: 'Erro ao obter lista de participantes' 
+    });
+  }
+});
+
+
+// ---- SMS Integration with Ombala API
+const axios = require('axios'); // Add this at the top with other requires
+
+// Ombala API Configuration
+const OMBALA_API_URL = 'https://api.useombala.ao/v1/messages';
+const OMBALA_API_TOKEN = process.env.OMBALA_API_TOKEN || '';
+const OMBALA_SENDER_NAME = process.env.OMBALA_SENDER_NAME || 'APRENDAEMPR';
+
+// Send SMS via Ombala API
+async function sendOmbalaSMS(phoneNumber, message) {
+  try {
+    // Clean phone number (remove spaces, plus signs, etc.)
+    const cleanPhone = phoneNumber.replace(/\D/g, '');
+    
+    // Ensure phone starts with country code for Angola
+    let formattedPhone = cleanPhone;
+    if (!formattedPhone.startsWith('244')) {
+      if (formattedPhone.startsWith('9') || formattedPhone.startsWith('2')) {
+        formattedPhone = '244' + formattedPhone;
+      } else if (formattedPhone.startsWith('0')) {
+        formattedPhone = '244' + formattedPhone.substring(1);
+      }
+    }
+    
+    const payload = {
+      message: message,
+      from: OMBALA_SENDER_NAME,
+      to: formattedPhone
+    };
+    
+    const response = await axios.post(OMBALA_API_URL, payload, {
+      headers: {
+        'Authorization': `Token ${OMBALA_API_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000 // 10 second timeout
+    });
+    
+    return {
+      success: true,
+      data: response.data,
+      messageId: response.data?.id
+    };
+    
+  } catch (error) {
+    console.error('[Ombala SMS] Error:', error.response?.data || error.message);
+    return {
+      success: false,
+      error: error.response?.data?.error || error.message,
+      status: error.response?.status
+    };
+  }
+}
+
+// Send thank you SMS after attendance registration
+app.post('/api/attendance/:id/send-sms', adminOnly, async (req, res) => {
+  try {
+    await ensureMongo();
+    
+    const attendanceId = req.params.id;
+    const { customMessage } = req.body;
+    
+    if (!OMBALA_API_TOKEN || !OMBALA_SENDER_NAME) {
+      return res.status(500).json({
+        success: false,
+        message: 'Configuração de SMS não está completa'
+      });
+    }
+    
+    // Find attendance record
+    const attendance = await Attendance.findById(attendanceId);
+    if (!attendance) {
+      return res.status(404).json({
+        success: false,
+        message: 'Registro de presença não encontrado'
+      });
+    }
+    
+    // Prepare thank you message
+    const message = customMessage || `
+Olá ${attendance.name.split(' ')[0]}! Obrigado por confirmar presença no evento Aprenda & Empreenda.
+
+📅 Data: 20 de Dezembro
+🕗 Hora: 8h00
+📍 Local: Sala de Conferência do Shopping Popular (Camama)
+
+Para mais informações: 942 218 877 | 953 990 348
+
+Contamos com a sua presença!
+Equipe Aprenda & Empreenda
+    `.trim();
+    
+    // Send SMS
+    const smsResult = await sendOmbalaSMS(attendance.phone, message);
+    
+    if (smsResult.success) {
+      // Update attendance record with SMS info
+      attendance.smsSent = true;
+      attendance.smsSentAt = new Date();
+      attendance.smsMessageId = smsResult.messageId;
+      await attendance.save();
+      
+      res.json({
+        success: true,
+        message: 'SMS enviado com sucesso',
+        data: {
+          attendanceId: attendance._id,
+          phone: attendance.phone,
+          message: message,
+          smsResult: smsResult.data
+        }
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        message: 'Falha ao enviar SMS',
+        error: smsResult.error
+      });
+    }
+    
+  } catch (e) {
+    console.error('[POST /api/attendance/:id/send-sms] error', e);
+    res.status(500).json({
+      success: false,
+      message: 'Erro ao processar pedido de SMS'
+    });
+  }
+});
+
+// Auto-send SMS on attendance registration (optional)
+app.post('/api/attendance-with-sms', async (req, res) => {
+  try {
+    await ensureMongo();
+    
+    const { name, phone } = req.body;
+    
+    // Basic validation
+    if (!name || !phone) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Nome e telefone são obrigatórios' 
+      });
+    }
+    
+    if (name.length < 3) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Nome deve ter pelo menos 3 caracteres' 
+      });
+    }
+    
+    if (phone.length < 9) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Telefone deve ter pelo menos 9 dígitos' 
+      });
+    }
+    
+    // Check if this phone already registered
+    const existing = await Attendance.findOne({ 
+      phone: phone,
+      event: 'Aprenda & Empreenda'
+    });
+    
+    if (existing) {
+      return res.status(409).json({ 
+        success: false, 
+        message: 'Este número já foi registado para o evento' 
+      });
+    }
+    
+    // Create attendance record
+    const attendance = await Attendance.create({
+      name: name.trim(),
+      phone: phone.trim(),
+      event: 'Aprenda & Empreenda',
+      date: new Date(),
+      confirmed: true
+    });
+    
+    // Try to send SMS (non-blocking)
+    let smsResult = null;
+    if (OMBALA_API_TOKEN && OMBALA_SENDER_NAME) {
+      try {
+        const message = `
+Olá ${name.split(' ')[0]}! Obrigado por confirmar presença no evento Aprenda & Empreenda.
+
+📅 Data: 20 de Dezembro
+🕗 Hora: 8h00
+📍 Local: Sala de Conferência do Shopping Popular (Camama)
+
+Para mais informações: 942 218 877 | 953 990 348
+
+Contamos com a sua presença!
+Equipe Aprenda & Empreenda
+        `.trim();
+        
+        smsResult = await sendOmbalaSMS(phone, message);
+        
+        if (smsResult.success) {
+          attendance.smsSent = true;
+          attendance.smsSentAt = new Date();
+          attendance.smsMessageId = smsResult.messageId;
+          await attendance.save();
+        }
+      } catch (smsError) {
+        console.warn('[Auto SMS] Failed to send:', smsError.message);
+        // Continue even if SMS fails
+      }
+    }
+    
+    res.status(201).json({ 
+      success: true, 
+      message: 'Presença confirmada com sucesso!' + (smsResult?.success ? ' SMS enviado.' : ''),
+      data: {
+        id: attendance._id,
+        name: attendance.name,
+        phone: attendance.phone,
+        date: attendance.date,
+        smsSent: smsResult?.success || false
+      }
+    });
+    
+  } catch (e) {
+    console.error('[POST /api/attendance-with-sms] error', e);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Erro ao processar a inscrição. Tente novamente.' 
     });
   }
 });
