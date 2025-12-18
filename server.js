@@ -575,17 +575,7 @@ app.post('/api/attendance-with-sms', async (req, res) => {
     if (OMBALA_API_TOKEN && OMBALA_SENDER_NAME) {
       try {
         const message = `
-Olá ${name.split(' ')[0]}! Obrigado por confirmar presença no evento Aprenda & Empreenda.
-
-📅 Data: 20 de Dezembro
-🕗 Hora: 8h00
-📍 Local: Sala de Conferência do Shopping Popular (Camama)
-
-Para mais informações: 942 218 877 | 953 990 348
-
-Contamos com a sua presença!
-Equipe Aprenda & Empreenda
-        `.trim();
+Olá ${name.split(' ')[0]}! Obrigado por confirmar presença na Conferência Aprenda & Empreenda.`.trim();
         
         smsResult = await sendOmbalaSMS(phone, message);
         
