@@ -292,7 +292,7 @@ const AttendanceSchema = new mongoose.Schema({
   smsSentAt: { type: Date },
   smsMessageId: { type: String },
   smsError: { type: String }
-}, { timestamps: true });
+}, { timestamps: true, collection: 'attendances' });
 const Attendance = mongoose.models.Attendance || mongoose.model('Attendance', AttendanceSchema);
 
 // POST route to save attendance
