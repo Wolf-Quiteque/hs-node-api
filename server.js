@@ -389,16 +389,10 @@ app.get('/api/attendance', adminOnly, async (req, res) => {
   }
 });
 
-
 // ---- Public Admin Routes (no authentication needed for viewing)
-// Replace your current /api/attendance/public route with this improved version:
 app.get('/api/attendance/public', async (req, res) => {
   try {
     await ensureMongo();
-    
-    console.log('=== PUBLIC ATTENDANCE REQUEST ===');
-    console.log('Query params:', req.query);
-    
     const {
       event = 'Aprenda & Empreenda',
         page = 1,
@@ -409,26 +403,23 @@ app.get('/api/attendance/public', async (req, res) => {
         sortOrder = 'desc'
     } = req.query;
     
-    // Build query - try with and without event filter
-    const query = {};
+    console.log('Public attendance request:', { event, page, limit, search, filter, sortBy, sortOrder });
     
-    // Try both with and without event filter for debugging
-    const testQuery = { event };
-    const testQueryAll = {};
+    // Try to get all events first to see what we have
+    const allEvents = await Attendance.distinct('event');
+    console.log('Available events in database:', allEvents);
     
-    const countWithEvent = await Attendance.countDocuments(testQuery);
-    const countAll = await Attendance.countDocuments(testQueryAll);
+    // Build query - first try with exact event name
+    let query = { event: event };
     
-    console.log(`Records with event "${event}":`, countWithEvent);
-    console.log(`Records total:`, countAll);
+    // If no results with exact name, try case-insensitive
+    const countWithExactEvent = await Attendance.countDocuments(query);
+    console.log(`Records with exact event "${event}":`, countWithExactEvent);
     
-    // Use event filter only if there are records with that event
-    if (countWithEvent > 0) {
-      query.event = event;
-    } else {
-      // If no records with specific event, get all records
-      console.log('No records found with specific event, getting all records');
-      // Don't filter by event
+    if (countWithExactEvent === 0 && allEvents.length > 0) {
+      // Try with first available event
+      query = { event: allEvents[0] };
+      console.log(`Trying with event: "${allEvents[0]}" instead`);
     }
     
     // Apply search filter
@@ -438,36 +429,29 @@ app.get('/api/attendance/public', async (req, res) => {
         { name: searchRegex },
         { phone: { $regex: search.trim() } }
       ];
-      console.log('Search filter applied:', search.trim());
     }
     
     // Apply SMS filter
     if (filter === 'sms-sent') {
       query.smsSent = true;
-      console.log('Filter: SMS sent only');
     } else if (filter === 'sms-not-sent') {
       query.smsSent = false;
-      console.log('Filter: SMS not sent only');
     }
     
-    console.log('Final query:', JSON.stringify(query, null, 2));
+    console.log('Final query:', JSON.stringify(query));
     
     // Calculate pagination
     const pageNum = Math.max(1, parseInt(page));
     const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
     const skip = (pageNum - 1) * limitNum;
     
-    // Build sort
+    // Build sort - fix for date field
     const sort = {};
-    if (sortBy === 'name') {
-      sort.name = sortOrder === 'asc' ? 1 : -1;
-    } else if (sortBy === 'phone') {
-      sort.phone = sortOrder === 'asc' ? 1 : -1;
-    } else {
+    if (sortBy === 'date') {
       sort.date = sortOrder === 'asc' ? 1 : -1;
+    } else {
+      sort[sortBy] = sortOrder === 'asc' ? 1 : -1;
     }
-    
-    console.log('Sort:', sort);
     
     // Get total count
     const total = await Attendance.countDocuments(query);
@@ -480,25 +464,14 @@ app.get('/api/attendance/public', async (req, res) => {
       .limit(limitNum)
       .lean();
     
-    console.log(`Retrieved ${data.length} records for page ${pageNum}`);
+    console.log(`Retrieved ${data.length} records`);
     
-    if (data.length > 0) {
-      console.log('Sample of returned data (first 3):');
-      data.slice(0, 3).forEach((record, index) => {
-        console.log(`Record ${index + 1}:`, {
-          id: record._id?.toString().substring(0, 8) + '...',
-          name: record.name,
-          phone: record.phone,
-          event: record.event,
-          date: record.date,
-          smsSent: record.smsSent
-        });
-      });
-    }
+    // Get current event from query (might have changed)
+    const currentEvent = query.event;
     
-    // Calculate statistics - always calculate from all records regardless of event
-    const totalCount = await Attendance.countDocuments({});
-    const smsSentCount = await Attendance.countDocuments({ smsSent: true });
+    // Calculate statistics using the current event
+    const totalCount = await Attendance.countDocuments({ event: currentEvent });
+    const smsSentCount = await Attendance.countDocuments({ event: currentEvent, smsSent: true });
     
     // Today's date at start of day
     const today = new Date();
@@ -508,6 +481,7 @@ app.get('/api/attendance/public', async (req, res) => {
     tomorrow.setDate(tomorrow.getDate() + 1);
     
     const todayCount = await Attendance.countDocuments({
+      event: currentEvent,
       date: { $gte: today, $lt: tomorrow }
     });
     
@@ -516,6 +490,7 @@ app.get('/api/attendance/public', async (req, res) => {
     oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
     
     const weekCount = await Attendance.countDocuments({
+      event: currentEvent,
       date: { $gte: oneWeekAgo }
     });
     
@@ -524,6 +499,7 @@ app.get('/api/attendance/public', async (req, res) => {
     twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);
     
     const lastWeekCount = await Attendance.countDocuments({
+      event: currentEvent,
       date: { $gte: twoWeeksAgo, $lt: oneWeekAgo }
     });
     
@@ -532,6 +508,7 @@ app.get('/api/attendance/public', async (req, res) => {
     yesterday.setDate(yesterday.getDate() - 1);
     
     const yesterdayCount = await Attendance.countDocuments({
+      event: currentEvent,
       date: { $gte: yesterday, $lt: today }
     });
     
@@ -546,6 +523,7 @@ app.get('/api/attendance/public', async (req, res) => {
     
     // SMS sent today
     const smsTodayCount = await Attendance.countDocuments({
+      event: currentEvent,
       smsSentAt: { $gte: today, $lt: tomorrow }
     });
     
@@ -568,18 +546,11 @@ app.get('/api/attendance/public', async (req, res) => {
         smsToday: smsTodayCount
       },
       debug: {
-        queryUsed: query,
-        countWithEvent,
-        countAll
+        queryEvent: currentEvent,
+        allEvents: allEvents,
+        recordCount: total
       }
     };
-    
-    console.log('Response statistics:', {
-      total: totalCount,
-      smsSent: smsSentCount,
-      today: todayCount,
-      week: weekCount
-    });
     
     res.json(response);
     
@@ -589,11 +560,11 @@ app.get('/api/attendance/public', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Erro ao obter lista de participantes',
-      error: e.message,
-      stack: e.stack
+      error: e.message
     });
   }
 });
+
 // Delete attendance (public but with basic validation)
 app.delete('/api/attendance/public/:id', async (req, res) => {
   try {
@@ -627,7 +598,7 @@ app.delete('/api/attendance/public/:id', async (req, res) => {
   }
 });
 
-// Add this debug route to your server.js (before module.exports)
+// Debug endpoint to check database contents
 app.get('/api/attendance/debug', async (req, res) => {
   try {
     await ensureMongo();
@@ -638,33 +609,26 @@ app.get('/api/attendance/debug', async (req, res) => {
     const allRecords = await Attendance.find({}).lean();
     console.log('Total records in database:', allRecords.length);
     
-    if (allRecords.length > 0) {
-      console.log('First 5 records:');
-      allRecords.slice(0, 5).forEach((record, index) => {
-        console.log(`Record ${index + 1}:`, {
-          id: record._id,
-          name: record.name,
-          phone: record.phone,
-          event: record.event,
-          date: record.date,
-          smsSent: record.smsSent,
-          smsSentAt: record.smsSentAt
-        });
-      });
-    }
-    
     // Check count by event
     const eventCounts = await Attendance.aggregate([
       { $group: { _id: "$event", count: { $sum: 1 } } }
     ]);
     console.log('Counts by event:', eventCounts);
     
+    // Get database info
+    const dbStats = await Attendance.db.db.stats();
+    
     res.json({
       success: true,
       totalRecords: allRecords.length,
       sampleRecords: allRecords.slice(0, 5),
       eventCounts: eventCounts,
-      databaseStatus: 'connected'
+      databaseStatus: 'connected',
+      dbStats: {
+        collections: dbStats.collections,
+        objects: dbStats.objects,
+        avgObjSize: dbStats.avgObjSize
+      }
     });
     
   } catch (e) {
