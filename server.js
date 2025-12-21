@@ -862,6 +862,266 @@ Olá ${name.split(' ')[0]}! Obrigado por confirmar presença na Conferência Apr
   }
 });
 
+
+// ---- Messenger SMS Routes
+app.post('/api/messenger/send', async (req, res) => {
+  try {
+    const { phoneNumbers, message, sender = OMBALA_SENDER_NAME } = req.body;
+    
+    if (!OMBALA_API_TOKEN || !OMBALA_SENDER_NAME) {
+      return res.status(500).json({
+        success: false,
+        message: 'Configuração de SMS não está completa'
+      });
+    }
+    
+    if (!phoneNumbers || !message) {
+      return res.status(400).json({
+        success: false,
+        message: 'Números de telefone e mensagem são obrigatórios'
+      });
+    }
+    
+    // Convert phoneNumbers to array if it's a string
+    let numbersArray = [];
+    if (typeof phoneNumbers === 'string') {
+      // Split by commas, semicolons, spaces, or newlines
+      numbersArray = phoneNumbers.split(/[,;\s\n]+/)
+        .map(num => num.trim())
+        .filter(num => num.length > 0);
+    } else if (Array.isArray(phoneNumbers)) {
+      numbersArray = phoneNumbers.map(num => String(num).trim());
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: 'Formato inválido para números de telefone'
+      });
+    }
+    
+    // Validate and clean phone numbers
+    const cleanedNumbers = numbersArray.map(phone => {
+      // Remove all non-digit characters
+      let clean = phone.replace(/\D/g, '');
+      
+      // If number starts with 9 or 2 (Angolan mobile) and is 9 digits, use as is
+      if (clean.length === 9 && (clean.startsWith('9') || clean.startsWith('2'))) {
+        return clean;
+      }
+      
+      // If number starts with 0, remove it (Angolan numbers)
+      if (clean.startsWith('0') && clean.length === 10) {
+        return clean.substring(1);
+      }
+      
+      // If number is 12 digits and starts with 244, remove country code
+      if (clean.length === 12 && clean.startsWith('244')) {
+        return clean.substring(3);
+      }
+      
+      // Return original if doesn't match patterns
+      return clean;
+    }).filter(phone => phone.length >= 9); // Filter out invalid numbers
+    
+    if (cleanedNumbers.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Nenhum número de telefone válido encontrado'
+      });
+    }
+    
+    console.log(`Sending SMS to ${cleanedNumbers.length} numbers`);
+    console.log('Numbers:', cleanedNumbers);
+    console.log('Message:', message.substring(0, 100) + (message.length > 100 ? '...' : ''));
+    
+    // Track results
+    const results = [];
+    let successful = 0;
+    let failed = 0;
+    
+    // Send SMS to each number
+    for (const phone of cleanedNumbers) {
+      try {
+        const smsResult = await sendOmbalaSMS(phone, message);
+        
+        results.push({
+          phone: phone,
+          success: smsResult.success,
+          messageId: smsResult.messageId,
+          error: smsResult.error
+        });
+        
+        if (smsResult.success) {
+          successful++;
+          console.log(`✓ SMS sent to ${phone}`);
+        } else {
+          failed++;
+          console.log(`✗ Failed to send to ${phone}:`, smsResult.error);
+        }
+        
+        // Small delay between requests to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 100));
+        
+      } catch (error) {
+        console.error(`Error sending to ${phone}:`, error.message);
+        results.push({
+          phone: phone,
+          success: false,
+          error: error.message
+        });
+        failed++;
+      }
+    }
+    
+    // Save message history if needed
+    if (successful > 0) {
+      try {
+        await ensureMongo();
+        
+        const MessageHistorySchema = new mongoose.Schema({
+          phoneNumbers: [String],
+          message: String,
+          sender: String,
+          successful: Number,
+          failed: Number,
+          total: Number,
+          results: [Object],
+          date: { type: Date, default: Date.now }
+        }, { timestamps: true });
+        
+        const MessageHistory = mongoose.models.MessageHistory || mongoose.model('MessageHistory', MessageHistorySchema);
+        
+        await MessageHistory.create({
+          phoneNumbers: cleanedNumbers,
+          message: message,
+          sender: sender,
+          successful: successful,
+          failed: failed,
+          total: cleanedNumbers.length,
+          results: results,
+          date: new Date()
+        });
+        
+      } catch (dbError) {
+        console.warn('Failed to save message history:', dbError.message);
+        // Non-critical error, continue
+      }
+    }
+    
+    res.json({
+      success: true,
+      message: `Mensagens enviadas: ${successful} sucesso, ${failed} falhas`,
+      stats: {
+        total: cleanedNumbers.length,
+        successful: successful,
+        failed: failed
+      },
+      results: results,
+      numbers: cleanedNumbers
+    });
+    
+  } catch (e) {
+    console.error('[POST /api/messenger/send] error', e);
+    res.status(500).json({
+      success: false,
+      message: 'Erro ao enviar mensagens',
+      error: e.message
+    });
+  }
+});
+
+// Get message history (optional)
+app.get('/api/messenger/history', async (req, res) => {
+  try {
+    await ensureMongo();
+    
+    const { page = 1, limit = 20 } = req.query;
+    const pageNum = Math.max(1, parseInt(page));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
+    const skip = (pageNum - 1) * limitNum;
+    
+    const MessageHistorySchema = new mongoose.Schema({
+      phoneNumbers: [String],
+      message: String,
+      sender: String,
+      successful: Number,
+      failed: Number,
+      total: Number,
+      results: [Object],
+      date: { type: Date, default: Date.now }
+    }, { timestamps: true });
+    
+    const MessageHistory = mongoose.models.MessageHistory || mongoose.model('MessageHistory', MessageHistorySchema);
+    
+    const total = await MessageHistory.countDocuments({});
+    const history = await MessageHistory.find({})
+      .sort({ date: -1 })
+      .skip(skip)
+      .limit(limitNum)
+      .lean();
+    
+    // Format history for display
+    const formattedHistory = history.map(record => ({
+      id: record._id,
+      date: record.date,
+      message: record.message.length > 100 ? record.message.substring(0, 100) + '...' : record.message,
+      totalNumbers: record.total,
+      successful: record.successful,
+      failed: record.failed,
+      phoneNumbers: record.phoneNumbers.slice(0, 3).join(', ') + (record.phoneNumbers.length > 3 ? `... (+${record.phoneNumbers.length - 3} mais)` : '')
+    }));
+    
+    res.json({
+      success: true,
+      data: formattedHistory,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        totalPages: Math.ceil(total / limitNum)
+      }
+    });
+    
+  } catch (e) {
+    console.error('[GET /api/messenger/history] error', e);
+    res.status(500).json({
+      success: false,
+      message: 'Erro ao obter histórico'
+    });
+  }
+});
+
+// Get Ombala balance (optional)
+app.get('/api/messenger/balance', async (req, res) => {
+  try {
+    if (!OMBALA_API_TOKEN) {
+      return res.status(500).json({
+        success: false,
+        message: 'Configuração de SMS não está completa'
+      });
+    }
+    
+    const response = await axios.get('https://api.useombala.ao/v1/credits', {
+      headers: {
+        'Authorization': `Token ${OMBALA_API_TOKEN}`
+      },
+      timeout: 10000
+    });
+    
+    res.json({
+      success: true,
+      data: response.data
+    });
+    
+  } catch (error) {
+    console.error('[GET /api/messenger/balance] error:', error.response?.data || error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Erro ao obter saldo',
+      error: error.response?.data?.error || error.message
+    });
+  }
+});
+
 // 👉 IMPORTANT: no app.listen() on Vercel
 // Export a handler so @vercel/node can invoke it:
 module.exports = app;          // Express is a handler function (req, res)
