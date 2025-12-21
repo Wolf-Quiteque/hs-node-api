@@ -866,7 +866,7 @@ Olá ${name.split(' ')[0]}! Obrigado por confirmar presença na Conferência Apr
 // ---- Messenger SMS Routes
 app.post('/api/messenger/send', async (req, res) => {
   try {
-    const { phoneNumbers, message, sender = OMBALA_SENDER_NAME } = req.body;
+    const { phoneNumbers, message } = req.body; // Removed sender parameter
     
     if (!OMBALA_API_TOKEN || !OMBALA_SENDER_NAME) {
       return res.status(500).json({
@@ -941,6 +941,7 @@ app.post('/api/messenger/send', async (req, res) => {
     // Send SMS to each number
     for (const phone of cleanedNumbers) {
       try {
+        // Use OMBALA_SENDER_NAME from environment variables
         const smsResult = await sendOmbalaSMS(phone, message);
         
         results.push({
@@ -969,41 +970,6 @@ app.post('/api/messenger/send', async (req, res) => {
           error: error.message
         });
         failed++;
-      }
-    }
-    
-    // Save message history if needed
-    if (successful > 0) {
-      try {
-        await ensureMongo();
-        
-        const MessageHistorySchema = new mongoose.Schema({
-          phoneNumbers: [String],
-          message: String,
-          sender: String,
-          successful: Number,
-          failed: Number,
-          total: Number,
-          results: [Object],
-          date: { type: Date, default: Date.now }
-        }, { timestamps: true });
-        
-        const MessageHistory = mongoose.models.MessageHistory || mongoose.model('MessageHistory', MessageHistorySchema);
-        
-        await MessageHistory.create({
-          phoneNumbers: cleanedNumbers,
-          message: message,
-          sender: sender,
-          successful: successful,
-          failed: failed,
-          total: cleanedNumbers.length,
-          results: results,
-          date: new Date()
-        });
-        
-      } catch (dbError) {
-        console.warn('Failed to save message history:', dbError.message);
-        // Non-critical error, continue
       }
     }
     
