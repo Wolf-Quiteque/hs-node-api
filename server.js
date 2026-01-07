@@ -2,6 +2,8 @@ require('dotenv').config(); // fine for local; on Vercel env comes from dashboar
 
 const express = require('express');
 const cors = require('cors');
+const nodemailer = require('nodemailer');
+const multer = require('multer');
 const mongoose = require('mongoose');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { NodeHttpHandler } = require('@aws-sdk/node-http-handler');
@@ -93,6 +95,143 @@ function extractKeyFromPublicUrl(publicUrl) {
 
 // ---- Health endpoints (help debug quickly)
 app.get('/api/health', (_req,res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// ---- Project Inquiry (Website Form -> Gmail)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 } // 8MB per file
+});
+
+// Accept up to 5 files from <input name="brandAssets" ...>
+app.post('/api/project-inquiry', upload.array('brandAssets', 5), async (req, res) => {
+  try {
+    const {
+      businessName,
+      website,
+      contactName,
+      preferredContactMethod,
+      email,
+      phone,
+
+      // the rest of your fields (safe even if blank)
+      mainGoal,
+      problem,
+      scaling,
+      projectType,
+      estimatedPages,
+      features,
+      futureNeeds,
+      brandTone,
+      brandToneOther,
+      designInspo,
+      adminPerson,
+      training,
+      source,
+      submittedAt
+    } = req.body || {};
+
+    // ---- Minimal validation (matches your frontend intent)
+    if (!businessName) {
+      return res.status(400).json({ ok: false, error: 'businessName is required' });
+    }
+    if (!preferredContactMethod || !['email', 'phone'].includes(preferredContactMethod)) {
+      return res.status(400).json({ ok: false, error: 'preferredContactMethod must be email or phone' });
+    }
+    if (preferredContactMethod === 'email' && !email) {
+      return res.status(400).json({ ok: false, error: 'email is required when preferredContactMethod=email' });
+    }
+    if (preferredContactMethod === 'phone' && !phone) {
+      return res.status(400).json({ ok: false, error: 'phone is required when preferredContactMethod=phone' });
+    }
+
+    // ---- Gmail transporter (App Password)
+    const {
+      GMAIL_USER,
+      GMAIL_APP_PASSWORD,
+      PROJECT_INQUIRY_TO
+    } = process.env;
+
+    if (!GMAIL_USER || !GMAIL_APP_PASSWORD || !PROJECT_INQUIRY_TO) {
+      return res.status(500).json({
+        ok: false,
+        error: 'Missing env vars: GMAIL_USER, GMAIL_APP_PASSWORD, PROJECT_INQUIRY_TO'
+      });
+    }
+
+    const transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: GMAIL_USER,
+        pass: GMAIL_APP_PASSWORD
+      }
+    });
+
+    const safe = (v) => (v == null || String(v).trim() === '' ? '—' : String(v).trim());
+
+    const subject = `New Project Inquiry: ${businessName}`;
+
+    const html = `
+      <h2>New Project Inquiry</h2>
+      <p><strong>Business Name:</strong> ${safe(businessName)}</p>
+      <p><strong>Website:</strong> ${safe(website)}</p>
+      <p><strong>Contact Name:</strong> ${safe(contactName)}</p>
+
+      <hr/>
+      <p><strong>Preferred Contact Method:</strong> ${safe(preferredContactMethod)}</p>
+      <p><strong>Email:</strong> ${safe(email)}</p>
+      <p><strong>Phone:</strong> ${safe(phone)}</p>
+
+      <hr/>
+      <p><strong>Main Goal:</strong><br/>${safe(mainGoal)}</p>
+      <p><strong>Problem:</strong><br/>${safe(problem)}</p>
+      <p><strong>Scaling (6–12 months):</strong> ${safe(scaling)}</p>
+
+      <hr/>
+      <p><strong>Project Type:</strong> ${safe(projectType)}</p>
+      <p><strong>Estimated Pages:</strong> ${safe(estimatedPages)}</p>
+      <p><strong>Features:</strong><br/>${safe(features)}</p>
+      <p><strong>Future Needs:</strong><br/>${safe(futureNeeds)}</p>
+
+      <hr/>
+      <p><strong>Brand Tone:</strong> ${safe(brandTone)}</p>
+      <p><strong>Brand Tone (Other):</strong> ${safe(brandToneOther)}</p>
+      <p><strong>Design Inspo:</strong><br/>${safe(designInspo)}</p>
+
+      <hr/>
+      <p><strong>Who will manage the site?</strong> ${safe(adminPerson)}</p>
+      <p><strong>Training needed?</strong> ${safe(training)}</p>
+
+      <hr/>
+      <p><strong>Source:</strong> ${safe(source)}</p>
+      <p><strong>Submitted At:</strong> ${safe(submittedAt)}</p>
+    `;
+
+    // Attach uploaded files (if any)
+    const attachments = (req.files || []).map((f) => ({
+      filename: f.originalname,
+      content: f.buffer,
+      contentType: f.mimetype
+    }));
+
+    await transporter.sendMail({
+      from: `"Website Inquiry" <${GMAIL_USER}>`,
+      to: PROJECT_INQUIRY_TO,
+      replyTo: preferredContactMethod === 'email' ? email : undefined,
+      subject,
+      html,
+      attachments
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[POST /api/project-inquiry] error', err);
+    return res.status(500).json({ ok: false, error: 'Failed to send email' });
+  }
+});
+
+
+
+
 app.get('/api/db-health', async (_req,res) => {
   const t0 = Date.now();
   try { await ensureMongo(); return res.json({ ok: true, ms: Date.now()-t0 }); }
